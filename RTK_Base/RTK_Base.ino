@@ -1,28 +1,4 @@
 
-/*******************************************************************************************************
-  Programs for Arduino - Copyright of the author Stuart Robinson - 04/04/20
-
-  This program is supplied as is, it is up to the user of the program to decide if the program is
-  suitable for the intended purpose and free from errors. 
-*******************************************************************************************************/
-
-
-/*******************************************************************************************************
-  Program Operation - This is a program that demonstrates the detailed setup of a LoRa test transmitter. 
-  A packet containing ASCII text is sent according to the frequency and LoRa settings specified in the
-  'Settings.h' file. The pins to access the lora device need to be defined in the 'Settings.h' file also.
-
-  The details of the packet sent and any errors are shown on the Arduino IDE Serial Monitor, together with
-  the transmit power used, the packet length and the CRC of the packet. The matching receive program,
-  '104_LoRa_Receiver' can be used to check the packets are being sent correctly, the frequency and LoRa
-  settings (in Settings.h) must be the same for the transmitter and receiver programs. Sample Serial
-  Monitor output;
-
-  10dBm Packet> Hello World 1234567890*  BytesSent,23  CRC,DAAB  TransmitTime,64mS  PacketsSent,2
-
-  Serial monitor baud rate is set at 9600
-*******************************************************************************************************/
-
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
@@ -40,19 +16,20 @@
 #include <SX128XLT.h>                                          //include the appropriate library  
 #include "Settings.h"                                          //include the setiings file, frequencies, LoRa settings etc   
 
-#include <HardwareSerial.h>
-
 const char* ssid = "Dat Gunner";
 const char* password = "12345678";
 
-SFE_UBLOX_GNSS_SERIAL myGNSS;
-HardwareSerial mySP(2); // use UART2
+SFE_UBLOX_GNSS myGNSS;
+
+#define myWire Wire // Connect using the Wire1 port. Change this if required
+#define gnssAddress 0x42 // The default I2C address for u-blox modules is 0x42. Change this if required
+//#define ENABLE_UPLOAD_OTA // comment this line for disabling OTA upload code
 
 SX128XLT LT;     //create a library class instance called LT
 
-//#define ENABLE_UPLOAD_OTA // comment this line for disabling OTA upload code
-#define mySerial Serial2 // Use Serial2 to connect to the GNSS module. Change this if required
 
+// for testing 
+uint8_t buffer[1029];
 
 uint8_t TXPacketL;
 uint32_t TXPacketCount, startmS, endmS;
@@ -75,9 +52,11 @@ void setup()
 {
   //Setup Serial
   Serial.begin(9600);
+  delay(1000);
 
 
-  /* _________________set up Wifi connection for OTA update ____________________ */  
+  //***************************************************************************************************
+  //set up Wifi connection for OTA update  
 #ifdef ENABLE_UPLOAD_OTA
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
@@ -119,38 +98,29 @@ void setup()
   Serial.print("ESP32 IP address: ");
   Serial.println(WiFi.localIP());
 #endif
-  /*_____________________________________________________________*/
+  //***************************************************************************************************
 
-  /* _______________________SPI initialization_______________________ */
+  //***************************************************************************************************
+  // SPI and Lora initialization
   SPI.begin();
 
-  //SPI beginTranscation is normally part of library routines, but if it is disabled in library
-  //a single instance is needed here, so uncomment the program line below
-  //SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
-
   //setup hardware pins used by device, then check if device is found
-   if (LT.begin(NSS, NRESET, RFBUSY, DIO1, DIO2, DIO3, RX_EN, TX_EN, LORA_DEVICE))
+  if (LT.begin(NSS, NRESET, RFBUSY, DIO1, DIO2, DIO3, RX_EN, TX_EN, LORA_DEVICE))
   {
-    Serial.println(F("LoRa Device found"));
+    Serial.println("LoRa Device found");
     delay(1000);
   }
   else
   {
-    Serial.println(F("No device responding"));
+    Serial.println("No device responding");
     while (1)
     {
     }
   }
-  /*_____________________________________________________________*/
 
 
-  //The function call list below shows the complete setup for the LoRa device using the information defined in the
+  //The function call below shows the complete setup for the LoRa device using the information defined in the
   //Settings.h file.
-  //The 'Setup LoRa device' list below can be replaced with a single function call;
-  //LT.setupLoRa(Frequency, Offset, SpreadingFactor, Bandwidth, CodeRate);  
-  //***************************************************************************************************
-  //Setup LoRa device
-  //***************************************************************************************************
   LT.setupLoRa(Frequency, Offset, SpreadingFactor, Bandwidth, CodeRate);
 
   Serial.println();
@@ -162,60 +132,199 @@ void setup()
 
   //***************************************************************************************************
 
-  //***************************************************************************************************
-  //Setup RTK module
-  //***************************************************************************************************
-  mySerial.begin(115200); // u-blox F9 and M10 modules default to 38400 baud. Change this if required
 
-  myGNSS.connectedToUART2(); // This tells the library we are connecting to UART2 so it uses the correct configuration keys
+  //***************************************************************************************************
+  //Setup I2C for communicating to RTK module
+  myWire.begin(); // Start I2C
 
-  while (myGNSS.begin(mySerial) == false) //Connect to the u-blox module using mySerial (defined above)
+  while (myGNSS.begin(myWire, gnssAddress) == false) //Connect to the u-blox module using our custom port and address
   {
-    Serial.println(F("u-blox GNSS not detected"));
-    
-    Serial.println(F("Attempting to enable the UBX protocol for output"));
-    
-    myGNSS.setUART2Output(COM_TYPE_UBX); // Enable UBX output. Disable NMEA output
-    
-    Serial.println(F("Retrying..."));
+    Serial.println(F("u-blox GNSS not detected. Retrying..."));
     delay (1000);
   }
+
+  myGNSS.setI2COutput(COM_TYPE_RTCM3); // Ensure RTCM3 is enabled for output
+  myGNSS.saveConfigSelective(VAL_CFG_SUBSEC_IOPORT); //Save the communications port settings to flash and BBR
   //***************************************************************************************************
+
 
   Serial.print(F("Base station ready"));
   Serial.println();
 
+  // // just for testing the case RTCM size > 255
+  // Serial.print("Buffer: ");
+  // for(uint16_t i = 0; i < 1029; i++)
+  // {
+  //   buffer[i] = i%255;
+  //   Serial.print(buffer[i]);
+  //   Serial.print(" ");
+  // } 
+  // Serial.print("\n");
+  
 }
 
 void loop()
 {
+  // enable updating code OTA
 #ifdef ENABLE_UPLOAD_OTA  
   ArduinoOTA.handle();
 #endif
 
   myGNSS.checkUblox(); //See if new data is available. Process bytes as they come in.
 
-  delay(250); //Don't pound too hard on the I2C bus
+  delay(500); //Don't pound too hard on the I2C bus
+
+  //sendLoraPacket(buffer, 200);
 }
 
 void sendLoraPacket(uint8_t buffer[], uint16_t size)
 {
-  // send fully RTCM msg to rover over Lora
-  uint8_t *to_send = buffer;                           
-  
-  startmS =  millis();                                         
-  //start transmit timer
-  if (LT.transmit(to_send, size, 10000, TXpower, WAIT_TX))        //will return packet length sent if OK, otherwise 0 if transmit error
+  if(size < 255)  // Deal with RTCM size < 255
   {
-    endmS = millis();                                          //packet sent, note end time
-    packet_is_OK();
+    // append an additional byte to the end of Lora packet for detecting order of Lora packet
+    // format of additional byte: | SYN (1 bit, set 1 if first packet, otherwise set 0) |  nb of remaining packets (3 bits)    | 4 bits reserved |   
+    buffer[size] = 0x80; // 10000000 in binary 
+
+    // to_send points to the first element in buffer
+    uint8_t *to_send = buffer;                           
+    
+    //start transmitting
+    if (LT.transmit(to_send, size + 1, 10000, TXpower, WAIT_TX))        //will return packet length sent if OK, otherwise 0 if transmit error
+    {
+      packet_is_OK();
+
+      // for(uint8_t i = 0; i < size + 1; i++)
+      // {
+      //   Serial.print(*(to_send + i));
+      //   Serial.print(" ");
+      // }
+      // Serial.println();
+    }
+    else
+    {
+      packet_is_Error();                                 //transmit packet returned 0, there was an error
+    }
   }
-  else
+  else // Deal with RTCM size >= 255
   {
-    packet_is_Error();                                 //transmit packet returned 0, there was an error
+    uint8_t numberOfPackets;
+    uint8_t SYN;
+    uint8_t nb_of_remaining_packets;
+
+    // compute the nb of packets needed to be transmitted
+    if(size / 254 == 0)
+      numberOfPackets = size/254;
+    else
+      numberOfPackets = size/254 + 1;
+
+    // start sending each packet
+    for(uint8_t i=1; i <= numberOfPackets ; i++)
+    {
+      if(i == 1) // first packet 
+      {
+        SYN = 1;
+        nb_of_remaining_packets = numberOfPackets - i;  
+
+        // define packet for copying data from the original buffer
+        uint8_t first_pack[255];
+        memcpy(first_pack, buffer, 255 * sizeof(uint8_t));
+
+        // append an additional byte to the end of Lora packet for detecting the order of Lora packet
+        first_pack[254] = (uint8_t) (nb_of_remaining_packets << 4) | (SYN << 7);
+
+        // to_send points to the first element in packet
+        uint8_t *to_send = first_pack;                           
+                                         
+        //start transmitting
+        if (LT.transmit(to_send, 255, 10000, TXpower, WAIT_TX))        //will return packet length sent if OK, otherwise 0 if transmit error
+        {
+          packet_is_OK();
+
+          // Serial.println("First packet");
+          // for(uint8_t j = 0; j < 255; j++)
+          // {
+          //   Serial.print(*(to_send + j));
+          //   Serial.print("  ");
+          // }
+          // Serial.println();
+        }
+        else
+        {
+          packet_is_Error();                                 //transmit packet returned 0, there was an error
+        }
+      }
+      else if (i == numberOfPackets) // last packet
+      {
+        SYN = 0;
+        nb_of_remaining_packets = 0;
+        uint8_t size_of_last_packet = size - 254* (numberOfPackets-1);
+
+        // define packet for copying data from the original buffer
+        uint8_t last_pack[size_of_last_packet+1];
+        memcpy(last_pack, buffer + 254 * (i-1), size_of_last_packet * sizeof(uint8_t));
+
+        // append an additional byte to the end of Lora packet for detecting the order of Lora packet
+        last_pack[size_of_last_packet] = (nb_of_remaining_packets << 4) | (SYN << 7);
+
+        // to_send points to the first element in packet
+        uint8_t *to_send = last_pack;                           
+                                            
+        //start transmitting 
+        if (LT.transmit(to_send, size_of_last_packet + 1 , 10000, TXpower, WAIT_TX))        //will return packet length sent if OK, otherwise 0 if transmit error
+        {
+          packet_is_OK();
+
+          // Serial.println("Last packet");
+          // for(uint8_t j = 0; j < size - 254* (numberOfPackets-1) + 1; j++)
+          // {
+          //   Serial.print(*(to_send + j));
+          //   Serial.print("  ");
+          // }
+          // Serial.println();
+        }
+        else
+        {
+          packet_is_Error();                                 //transmit packet returned 0, there was an error
+        }
+      }
+      else {
+        SYN = 0;
+        nb_of_remaining_packets = numberOfPackets - i;
+
+        // define packet for copying data from the original buffer
+        uint8_t middle_pack[255];
+        memcpy(middle_pack, buffer + 254 * (i-1), 255 * sizeof(uint8_t));
+
+        // append an additional byte to the end of Lora packet for detecting the order of Lora packet 
+        middle_pack[254] = (nb_of_remaining_packets << 4) | (SYN << 7);
+
+        // to_send points to the first element in packet
+        uint8_t *to_send = middle_pack;                           
+                                             
+        //start transmitting
+        if (LT.transmit(to_send, 255, 10000, TXpower, WAIT_TX))        //will return packet length sent if OK, otherwise 0 if transmit error
+        {
+          packet_is_OK();
+
+          // Serial.println("Middle packet");
+          // Serial.print("Remaining packets: ");
+          // Serial.println(nb_of_remaining_packets);
+          // for(uint8_t j = 0; j < 255; j++)
+          // {
+          //   Serial.print(*(to_send + j));
+          //   Serial.print("  ");
+          // }
+          // Serial.println();
+        }
+        else
+        {
+          packet_is_Error();                                 //transmit packet returned 0, there was an error
+        }
+      }
+    }
   }
 
-  delay(1000);                                 //have a delay between packets
+  //delay(1000);                                 //have a delay between packets
 }
 
 //This function gets called from the SparkFun u-blox Arduino Library.
@@ -310,6 +419,7 @@ void DevUBLOXGNSS::processRTCM(uint8_t incoming)
   }
 
 }
+
 
 void packet_is_OK()
 {

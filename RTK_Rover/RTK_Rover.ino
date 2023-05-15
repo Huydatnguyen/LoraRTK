@@ -1,32 +1,4 @@
 
-/*******************************************************************************************************
-  Programs for Arduino - Copyright of the author Stuart Robinson - 04/04/20
-
-  This program is supplied as is, it is up to the user of the program to decide if the program is
-  suitable for the intended purpose and free from errors. 
-*******************************************************************************************************/
-
-/*******************************************************************************************************
-  Program Operation - This is a program that demonstrates the detailed setup of a LoRa test receiver.
-  The program listens for incoming packets using the LoRa settings in the 'Settings.h' file. The pins 
-  to access the lora device need to be defined in the 'Settings.h' file also.
-
-  There is a printout on the Arduino IDE Serial Monitor of the valid packets received, the packet is 
-  assumed to be in ASCII printable text, if it's not ASCII text characters from 0x20 to 0x7F, expect 
-  weird things to happen on the Serial Monitor. The LED will flash for each packet received and the 
-  buzzer will sound, if fitted.
-
-  Sample serial monitor output;
-
-  7s  Hello World 1234567890*,CRC,DAAB,RSSI,-52dBm,SNR,9dB,Length,23,Packets,5,Errors,0,IRQreg,50
-
-  If there is a packet error it might look like this, which is showing a CRC error,
-
-  968s PacketError,RSSI,-87dBm,SNR,-11dB,Length,23,Packets,613,Errors,2,IRQreg,70,IRQ_HEADER_VALID,IRQ_CRC_ERROR,IRQ_RX_DONE
-  
-  Serial monitor baud rate is set at 9600.
-*******************************************************************************************************/
-
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
@@ -44,39 +16,43 @@
 #include <SX128XLT.h>                                          //include the appropriate library  
 #include "Settings.h"                                          //include the setiings file, frequencies, LoRa settings etc   
 
-#include <HardwareSerial.h>
-
 
 const char* ssid = "Dat Gunner";
 const char* password = "12345678";
 
-SFE_UBLOX_GNSS_SERIAL myGNSS;
-HardwareSerial mySP(2); // use UART2
+SFE_UBLOX_GNSS myGNSS;
+
+#define myWire Wire // Connect using the Wire1 port. Change this if required
+#define gnssAddress 0x42 // The default I2C address for u-blox modules is 0x42. Change this if required
+//#define ENABLE_UPLOAD_OTA // comment this line for disabling OTA upload code
 
 SX128XLT LT;                                     //create a library class instance called LT
-
-//#define ENABLE_UPLOAD_OTA // comment this line for disabling OTA upload code
-#define mySerial Serial2 // Use Serial2 to connect to the GNSS module. Change this if required
 
 
 uint32_t RXpacketCount;
 uint32_t errors;
 
 uint8_t RXBUFFER[RXBUFFER_SIZE];                 //create the buffer that received packets are copied into
+uint8_t RTCM_FULL_BUFFER[1029];                  // buffer for full size RTCM sentence, can be up to 1029 bytes
 
 uint8_t RXPacketL;                               //stores length of packet received
 int16_t PacketRSSI;                              //stores RSSI of received packet
 int8_t  PacketSNR;                               //stores signal to noise ratio (SNR) of received packet
 
+// variables for processing Lora packet received before sending out the RTCM sentences to RTK of rover
+bool ready_for_sendingRTCM = false;
+uint16_t totalSize_of_RTCM = 0; // max 1029
+uint8_t nb_of_packets = 0 ; // nb of total Lora packets 
+
 void setup()
 {
   //***************************************************************************************************
   //Setup Serial for testing
-  //***************************************************************************************************
   Serial.begin(9600);
+  delay(1000);
 
-
- /* _________________set up Wifi connection for OTA update ____________________ */  
+  //***************************************************************************************************
+  //set up Wifi connection for OTA update 
 #ifdef ENABLE_UPLOAD_OTA
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
@@ -118,37 +94,29 @@ void setup()
   Serial.print("ESP32 IP address: ");
   Serial.println(WiFi.localIP());
 #endif
-  /*_____________________________________________________________*/
+  //***************************************************************************************************
 
-
-  // SPI initialization
+  //***************************************************************************************************
+  // SPI and Lora initialization
   SPI.begin();
 
-  //SPI beginTranscation is normally part of library routines, but if it is disabled in library
-  //a single instance is needed here, so uncomment the program line below
-  //SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
-
   //setup hardware pins used by device, then check if device is found
-   if (LT.begin(NSS, NRESET, RFBUSY, DIO1, DIO2, DIO3, RX_EN, TX_EN, LORA_DEVICE))
+  if (LT.begin(NSS, NRESET, RFBUSY, DIO1, DIO2, DIO3, RX_EN, TX_EN, LORA_DEVICE))
   {
-    Serial.println(F("LoRa Device found"));
+    Serial.println("LoRa Device found");
     delay(1000);
   }
   else
   {
-    Serial.println(F("No device responding"));
+    Serial.println("No device responding");
     while (1)
     {
     }
   }
 
-  //The function call list below shows the complete setup for the LoRa device using the information defined in the
+
+  //The function call below shows the complete setup for the LoRa device using the information defined in the
   //Settings.h file.
-  //The 'Setup LoRa device' list below can be replaced with a single function call;
-  //LT.setupLoRa(Frequency, Offset, SpreadingFactor, Bandwidth, CodeRate); 
-  //***************************************************************************************************
-  //Setup LoRa device
-  //***************************************************************************************************
   LT.setupLoRa(Frequency, Offset, SpreadingFactor, Bandwidth, CodeRate);
 
   Serial.println();
@@ -158,25 +126,22 @@ void setup()
   Serial.println();
   Serial.println();
 
+  //***************************************************************************************************
 
   //***************************************************************************************************
-  //Setup RTK module
-  //***************************************************************************************************
-  mySerial.begin(115200); // u-blox F9 and M10 modules default to 38400 baud. Change this if required
+  //Setup I2C for communicating to RTK module
+  myWire.begin(); // Start I2C
 
-  myGNSS.connectedToUART2(); // This tells the library we are connecting to UART2 so it uses the correct configuration keys
-
-  while (myGNSS.begin(mySerial) == false) //Connect to the u-blox module using mySerial (defined above)
+  while (myGNSS.begin(myWire, gnssAddress) == false) //Connect to the u-blox module using our custom port and address
   {
-    Serial.println(F("u-blox GNSS not detected"));
-    
-    Serial.println(F("Attempting to enable the UBX protocol for output"));
-    
-    myGNSS.setUART2Output(COM_TYPE_UBX); // Enable UBX output. Disable NMEA output
-    
-    Serial.println(F("Retrying..."));
+    Serial.println(F("u-blox GNSS not detected. Retrying..."));
     delay (1000);
   }
+
+  // myGNSS.setI2CInput(COM_TYPE_UBX | COM_TYPE_NMEA | COM_TYPE_RTCM3); // Ensure RTCM3 is enabled for input
+  // myGNSS.setI2COutput(COM_TYPE_UBX); // Ensure UBX is enabled for retrieving the info after correction  
+  // myGNSS.saveConfigSelective(VAL_CFG_SUBSEC_IOPORT); //Save the communications port settings to flash and BBR
+  
   //***************************************************************************************************
 
   Serial.print(F("Rover ready"));
@@ -192,6 +157,11 @@ void loop()
   ArduinoOTA.handle();
 #endif
 
+  receiveLoraPacket();
+}
+
+void receiveLoraPacket()
+{
 // receiving Lora packet
   RXPacketL = LT.receive(RXBUFFER, RXBUFFER_SIZE, 60000, WAIT_RX); //wait for a packet to arrive with 60seconds (60000mS) timeout
 
@@ -208,24 +178,90 @@ void loop()
   }
 }
 
-
 void packet_is_OK()
 {
   uint16_t IRQStatus, localCRC;
+  uint8_t SYN;
+  uint8_t nb_of_remaining_packets;
 
-  IRQStatus = LT.readIrqStatus();                 //read the LoRa device IRQ status register
+  //IRQStatus = LT.readIrqStatus();                 //read the LoRa device IRQ status register
 
 
-  printf("Receiving RTCM msg over Lora______________________ \n");
-  for(uint8_t i = 0; i < RXPacketL; i++)
+  // Serial.print("Receiving RTCM msg over Lora______________________ \n");
+  // for(uint8_t i = 0; i < RXPacketL; i++)
+  // {
+  //   Serial.print(RXBUFFER[i]);
+  //   Serial.print(" ");
+  // }
+  // Serial.println();
+
+  //retrieve the SYN bit and the nb of remaining packets in the last byte of Lora packet
+  SYN = RXBUFFER[RXPacketL-1] >> 7;
+  nb_of_remaining_packets = (RXBUFFER[RXPacketL-1] >> 4) & B00000111;
+
+  Serial.print("SYN bit:  ");
+  Serial.print(SYN);
+  Serial.print("         remaining :  ");
+  Serial.print(nb_of_remaining_packets);
+  Serial.println();
+
+  if(SYN == 1) //the first packet
   {
-    printf("%02X ", RXBUFFER[i]);
-  }
-  printf("\n");
+    if(nb_of_remaining_packets == 0) // the first byte is also the last byte
+    {
+      // copy RXBUFFER from Lora to RTCM_FULL_BUFFER for sending to RTK module of rover
+      memcpy(RTCM_FULL_BUFFER, RXBUFFER, (RXPacketL-1) * sizeof(uint8_t));
 
-  // sending RTCM sentence to ZED F9P 
-  myGNSS.pushRawData(RXBUFFER, RXPacketL, false);
-  
+      ready_for_sendingRTCM = true;
+      totalSize_of_RTCM = RXPacketL-1;    
+    }
+    else
+    {
+      nb_of_packets = nb_of_remaining_packets + 1;
+
+      // copy RXBUFFER from Lora to RTCM_FULL_BUFFER for sending to RTK module of rover
+      memcpy(RTCM_FULL_BUFFER, RXBUFFER, (RXPacketL-1) * sizeof(uint8_t));
+
+      totalSize_of_RTCM += RXPacketL-1;
+    }
+  } 
+  else // not the first packet
+  {
+    if(nb_of_packets != 0)
+    {
+      // copy RXBUFFER from Lora to RTCM_FULL_BUFFER for sending to RTK module of rover
+      memcpy(RTCM_FULL_BUFFER + 254 * (nb_of_packets-nb_of_remaining_packets - 1), RXBUFFER, (RXPacketL-1) * sizeof(uint8_t));
+      totalSize_of_RTCM += RXPacketL-1;
+
+      if(nb_of_remaining_packets == 0) // the last packet
+      {
+        ready_for_sendingRTCM = true;
+      }
+    }
+  }
+
+
+  if(ready_for_sendingRTCM)
+  {
+    Serial.print("RTCM final Buffer: ");
+    for(uint16_t i = 0; i < totalSize_of_RTCM; i++)
+    {
+      Serial.print(RTCM_FULL_BUFFER[i]);
+      Serial.print(" ");
+    } 
+    Serial.println();
+
+    Serial.println("Done");
+
+    // reset some variables for making it ready to process the next turn
+    ready_for_sendingRTCM = false;
+    nb_of_packets = 0; 
+    totalSize_of_RTCM = 0;
+
+    // sending RTCM sentence to ZED F9P 
+    //myGNSS.pushRawData(RTCM_FULL_BUFFER, totalSize_of_RTCM, false); 
+
+  }
 }
 
 
